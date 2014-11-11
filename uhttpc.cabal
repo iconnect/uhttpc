@@ -57,10 +57,10 @@ executable uhttpc-bench
     base,
     bytestring,
     bytestring-lexing,
+    deepseq,
     network,
     -- build-deps which need version bounds
     async             ==2.0.*,
-    bytestring-lexing ==0.4.*,
     cmdargs           ==0.10.*
 
 

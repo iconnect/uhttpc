@@ -4,6 +4,7 @@ module Main (main) where
 
 import           Control.Concurrent
 import           Control.Concurrent.Async
+import           Control.DeepSeq (deepseq)
 import           Control.Monad
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -53,6 +54,7 @@ data Args = Args
     , argWait      :: Double
     , argUrl       :: String
     , argPostFn    :: FilePath
+    , argPostList  :: FilePath
     } deriving (Show,Data,Typeable)
 
 defaultArgs :: Args
@@ -77,6 +79,8 @@ defaultArgs = Args
                      &= help "disable statistics"
     , argPostFn    = def &= typFile &= name "p" &= explicit
                      &= help "perform POST request with file-content as body"
+    , argPostList  = def &= typFile &= name "l" &= explicit
+                     &= help "perform a POST request per line, no quoting, round-robin, each client independently"
     , argLAddr     = def &= typ "addr" &= name "local-addr" &= explicit
                      &= help "set specific source address for TCP connections"
     , argWait      = def &= typ "sec" &= name "wait" &= explicit
@@ -137,26 +141,48 @@ main = runInUnboundThread $ do
         putStrLn "*WARNING* client-count should be >= thread-count"
 
     ----------------------------------------------------------------------------
-    let isPost = not $ null (argPostFn pargs)
+    let postOrGet = if null (argPostFn pargs) && null (argPostList pargs)
+                    then GET
+                    else POST
 
-    rawreqb <- if isPost
-               then fmap Just $ B.readFile (argPostFn pargs)
-               else return Nothing
+    when (verbose && not (null (argPostList pargs))) $
+      putStrLn "reading the input file and preparing requests...\n"
+
+    bodyList <- if not (null $ argPostList pargs)  -- overrides argPostFn
+                then fmap (take (fI $ argNumReq pargs)  -- will at most use this
+                           . map Just
+                           . B8.lines)
+                          $ B.readFile (argPostList pargs)
+                else if not (null $ argPostFn pargs)
+                then fmap (map Just . (: [])) $ B.readFile (argPostFn pargs)
+                else return [Nothing]
 
     let hdrs | null (argUA pargs) = map B8.pack (argHdrs pargs)
              | otherwise          = "User-Agent: " <> B8.pack (argUA pargs) :
                                     map B8.pack (argHdrs pargs)
+        mkRawreq :: Maybe B8.ByteString -> IO ByteString
+        mkRawreq rawreqb = do
+          let rawreqblen = maybe 0 B.length rawreqb
+              msg = mkHttp11Req postOrGet
+                                (B8.pack urlpath)
+                                ("Host: " <> B8.pack hostname
+                                 <> ":" <> B8.pack (show portnum))
+                                (argKeepAlive pargs)
+                                hdrs
+                                rawreqb
+          -- Printed when preparing the requests, not when sending.
+          when verbose $
+            printf "using %d-byte request message (%d-byte body):\n %s\n\n"
+                   (B.length msg) rawreqblen (show msg)
+          return $! msg
 
-        rawreqblen = maybe 0 B.length rawreqb
-        rawreq = mkHttp11Req (if isPost then POST else GET)
-                             (B8.pack urlpath)
-                             ("Host: " <> B8.pack hostname <> ":" <> B8.pack (show portnum))
-                             (argKeepAlive pargs)
-                             hdrs
-                             rawreqb
+    rawreqList <- mapM mkRawreq bodyList
+    let reqList = cycle rawreqList
 
-    when verbose $
-        printf "using %d-byte request message (%d-byte body):\n %s\n\n" (B.length rawreq) rawreqblen (show rawreq)
+    -- We make sure the list is fully evaluated _before_ we send anything.
+    rawreqList `deepseq`
+      when (verbose && not (null (argPostList pargs))) $
+        putStrLn $ show (length rawreqList) ++ " request(s) prepared\n"
 
     putStrLn "starting benchmark..."
 
@@ -164,7 +190,7 @@ main = runInUnboundThread $ do
 
     performGC
     ts0' <- getTS
-    tss  <- mapConcurrently (\() -> timeIO (doReqs lsa sa reqCounter rawreq (argWait pargs)))
+    tss  <- mapConcurrently (\() -> timeIO (doReqs lsa sa reqCounter reqList (argWait pargs)))
                             (replicate (fI $ argClnCnt pargs) ())
     ts1' <- getTS
     performGC
@@ -262,16 +288,17 @@ main = runInUnboundThread $ do
     hist xs = [ (head g, length g) | g <- group (sort xs) ]
 
 -- |repeat executing 'doReq' until req-counter goes below 0
-doReqs :: Maybe SockAddr -> SockAddr -> IORef Int -> ByteString -> Double -> IO [Entry]
-doReqs lsa sa cntref req wtime = go Nothing []
+doReqs :: Maybe SockAddr -> SockAddr -> IORef Int -> [ByteString] -> Double -> IO [Entry]
+doReqs lsa sa cntref reqList wtime = go Nothing [] reqList
   where
-    go ss a = do
+    go _ _ [] = fail "internal error: request list ran out"
+    go ss a (req : rest) = do
         notDone <- decReqCounter cntref
         if notDone
         then do
             (ss',r) <- doReq lsa sa ss req
             when (wtimeUsecs > 0) $ threadDelay wtimeUsecs
-            go ss' (r:a)
+            go ss' (r:a) rest
         else do
             maybe (return ()) ssClose ss
             return a
